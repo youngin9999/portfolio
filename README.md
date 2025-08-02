@@ -1,6 +1,11 @@
 
+2025. 0803
+i think 
 
-2025- 07 - 14
+
+
+
+2025.0714
 
 We need to find a better solution here . 
 We have to identify the areas where improvements can be made . 
