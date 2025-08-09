@@ -1,8 +1,0 @@
-data.json,Vehicle: 0,Vehicle: 1,Vehicle: 2,Vehicle: 3,Vehicle: 4,Vehicle: 5,Vehicle: 6,Vehicle: 7,Vehicle: 8,Vehicle: 9,Vehicle: 10,Vehicle: 11,Total
-Re-handling Cost,93000,92000,93000,69000,91000,92500,94000,27000,156000,121000,159000,141000,1228500
-Routing Cost,210055.0,183150.0,212030.0,179670.0,187675.0,199645.0,189330.0,161780.0,198560.0,222510.0,209040.0,169680.0,2323125.0
-Total Cost,,,,,,,,,,,,,3551625.0
-data.json,Vehicle: 0,Vehicle: 1,Vehicle: 2,Vehicle: 3,Vehicle: 4,Vehicle: 5,Vehicle: 6,Total
-Re-handling Cost,212000,220500,32500,45000,43000,45000,142000,740000
-Routing Cost,237915.0,239160.0,189060.0,207985.0,197275.0,193235.0,205605.0,1470235.0
-Total Cost,,,,,,,,2210235.0
