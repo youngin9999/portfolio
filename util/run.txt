@@ -1,0 +1,7 @@
+python yoloeasyocr.py ^
+  --weights .\model\yolov11n-doclaynet.pt ^
+  --data_csv .\data\test.csv ^
+  --out_csv .\output\submission.csv ^
+  --device 0 ^
+  --poppler_path "C:\Contest\Release-24.08.0-0\poppler-24.08.0\Library\bin" ^
+  --soffice_path "C:\Program Files\LibreOffice\program\soffice.exe"

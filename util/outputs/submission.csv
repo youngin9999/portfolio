@@ -1,0 +1,10 @@
+﻿ID,category_type,confidence_score,order,text,bbox
+TEST_01,text,0.502236,0,Wreheahea+emmd mse,"150, 495, 1127, 608"
+TEST_02,title,0.293663,0,`I탕 IYIo loI I요긍률몫 lo,"87, 88, 1308, 179"
+TEST_02,text,0.446306,1,perereeareeemghesfa,"197, 1116, 2368, 1395"
+TEST_03,text,0.738252,0,Visually-rich Document Understanding,"68, 55, 489, 79"
+TEST_03,text,0.381922,1,H bov극+d를b'?t's으ToY우표 Ho올클h곰lozs'hy,"68, 103, 1089, 170"
+TEST_03,text,0.849535,2,T+a+Mae he-her hre+eessae,"65, 185, 1210, 296"
+TEST_03,text,0.558686,3,수식추출의경우LaTex형식으로추출해야합니다,"82, 299, 653, 327"
+TEST_03,text,0.913129,4,s chv+en H zhth sh,"66, 330, 1211, 442"
+TEST_03,table,0.831806,5,,"59, 462, 345, 673"
