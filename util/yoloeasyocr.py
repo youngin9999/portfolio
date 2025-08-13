@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""
+r"""
 YOLO + EasyOCR + PPTX(poppler) 지원
 - PPTX: LibreOffice(headless)로 PDF 변환 → pdf2image(poppler)로 이미지 렌더
 - PDF: pdf2image(poppler)로 렌더
 - JPG/PNG: 그대로 로드
-
+python yoloeasyocr.py ^
+  --weights .\model\yolov11n-doclaynet.pt ^
+  --data_csv .\data\test.csv ^
+  --out_csv .\output\submission.csv ^
+  --device 0 ^
+  --poppler_path "C:\Contest\Release-24.08.0-0\poppler-24.08.0\Library\bin" ^
+  --soffice_path "C:\Program Files\LibreOffice\program\soffice.exe"
  
 """
 from __future__ import annotations
