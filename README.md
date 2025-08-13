@@ -1,5 +1,16 @@
-2024.0813 (sam)
+2024.0813-14 (sam)
+Today, I learned how to use Docker.
+Now I can run my script in an environment identical to the competition site.
 
+✅ My To-Do List
+
+1. Search for the official grading criteria on the competition website.
+
+2. Generate YOLO and OCR datasets.
+
+3. Design the post-processing logic.
+
+4. Design the order-setting logic.
 
 2024.0807 (samsung competition)
 
