@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 6
+names: ['image', 'pagenumber', 'subtitle', 'table', 'text', 'title']
+
+roboflow:
+  workspace: samsung-competition
+  project: my-first-project-9zbk7
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/samsung-competition/my-first-project-9zbk7/dataset/2

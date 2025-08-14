@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 r"""
-YOLO + EasyOCR + PPTX(poppler) 지원
-- PPTX: LibreOffice(headless)로 PDF 변환 → pdf2image(poppler)로 이미지 렌더
-- PDF: pdf2image(poppler)로 렌더
-- JPG/PNG: 그대로 로드
-python yoloeasyocr.py ^
-  --weights .\model\yolov11n-doclaynet.pt ^
-  --data_csv .\data\test.csv ^
-  --out_csv .\output\submission.csv ^
-  --device 0 ^
-  --poppler_path "C:\Contest\Release-24.08.0-0\poppler-24.08.0\Library\bin" ^
-  --soffice_path "C:\Program Files\LibreOffice\program\soffice.exe"
- 
+yoloeasyocr.py  (Docker-friendly)
+- 실행만 하면(util 폴더에서) model/weights, data/test.csv, output/submission.csv를 기본값으로 사용
+- PDF: pdf2image(+Poppler), PPTX: LibreOffice(soffice)→PDF→pdf2image, PNG/JPG: 그대로
+- CSV 생성 후 viz_boxes_poppler.py가 있으면 자동으로 시각화(viz/*.png)까지 수행
 """
+
 from __future__ import annotations
 import argparse
 import csv
@@ -28,29 +22,27 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
-
 from ultralytics import YOLO
 
-# PyMuPDF (일부 상황에서 보조로 쓸 수도 있음)
+# 선택: PyMuPDF 임포트 시도(폴백용 아님, 설치여부만 허용)
 try:
     import pymupdf as fitz  # noqa: F401
 except Exception:
     try:
-        import fitz  # type: ignore # noqa: F401
+        import fitz  # type: ignore  # noqa: F401
     except Exception:
-        fitz = None  # 선택적
+        fitz = None
 
-# EasyOCR
+# OCR
 import easyocr
-# pdf2image(poppler)
+# PDF -> 이미지
 from pdf2image import convert_from_path
 
-# =====================
-# Config / Constants
-# =====================
+# ===================== 공통 설정 =====================
 CATEGORY_NAMES = ["title", "subtitle", "text", "image", "table", "equation"]
 TEXT_CATS = {"title", "subtitle", "text"}
 
+# YOLO 클래스명 정규화(가중치가 DocLayNet 라벨이라 가정)
 NAME_CANON = {
     "Text": "text",
     "Title": "title",
@@ -59,6 +51,8 @@ NAME_CANON = {
     "Table": "table",
     "Picture": "image",
 }
+
+BASE_DIR = Path(__file__).resolve().parent  # util/
 
 @dataclass
 class Det:
@@ -82,10 +76,7 @@ class Det:
             bbox_str,
         )
 
-# =====================
-# Utilities
-# =====================
-
+# ===================== 유틸 =====================
 def normalize_device(dev):
     s = str(dev).lower()
     if s in {"cpu", "-1"}:
@@ -99,27 +90,30 @@ def normalize_device(dev):
 def load_yolo(weights: Path):
     return YOLO(str(weights))
 
-def init_easyocr(langs: str = "ko,en", model_dir: str = "./easyocr_models",
-                 download: bool = False, gpu: bool = False) -> easyocr.Reader:
+def init_easyocr(
+    langs: str = "ko,en",
+    model_dir: str = "./easyocr_models",
+    download: bool = False,
+    gpu: bool = False,
+) -> easyocr.Reader:
     lang_list = [x.strip() for x in langs.split(",") if x.strip()]
     return easyocr.Reader(
         lang_list,
-        download_enabled=download,
-        model_storage_directory=model_dir,
-        gpu=gpu
+        download_enabled=download,          # 오프라인 컨테이너면 False 유지
+        model_storage_directory=model_dir,  # util/easyocr_models 사용
+        gpu=gpu,
     )
 
 def _find_soffice(soffice_path: str | None) -> str | None:
-    if soffice_path:
-        p = Path(soffice_path)
-        if p.exists():
-            return str(p)
-    # 리눅스: soffice / libreoffice
+    # 1) 인자 경로
+    if soffice_path and Path(soffice_path).exists():
+        return soffice_path
+    # 2) 리눅스 PATH(도커에 libreoffice 설치되어 있으면 잡힘)
     for name in ("soffice", "libreoffice"):
         exe = shutil.which(name)
         if exe:
             return exe
-    # 윈도우 기본 경로 추정
+    # 3) 윈도 기본 경로(컨테이너에선 보통 안 씀)
     for p in (
         r"C:\Program Files\LibreOffice\program\soffice.exe",
         r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
@@ -130,19 +124,17 @@ def _find_soffice(soffice_path: str | None) -> str | None:
 
 def pdf_to_images_pdf2image(pdf_path: Path, dpi: int, poppler_path: str | None):
     kw = {"dpi": dpi}
+    # 리눅스 도커는 poppler-utils가 PATH에 있으므로 보통 인자 불필요
     if poppler_path:
         kw["poppler_path"] = poppler_path
-    # output_folder/ fmt 생략: 메모리 내 PIL 리스트 반환
     return convert_from_path(str(pdf_path), **kw)
 
-def convert_to_images(input_path: Path, dpi: int = 200,
-                      poppler_path: str | None = None,
-                      soffice_path: str | None = None) -> List[Image.Image]:
-    """
-    - PDF : pdf2image(poppler)
-    - PPTX: LibreOffice(headless)로 PDF 변환 후 pdf2image(poppler)
-    - JPG/PNG: 바로 로드
-    """
+def convert_to_images(
+    input_path: Path,
+    dpi: int = 200,
+    poppler_path: str | None = None,
+    soffice_path: str | None = None,
+) -> List[Image.Image]:
     ext = input_path.suffix.lower()
     if ext in {".jpg", ".jpeg", ".png"}:
         return [Image.open(str(input_path)).convert("RGB")]
@@ -151,10 +143,7 @@ def convert_to_images(input_path: Path, dpi: int = 200,
     if ext == ".pptx":
         exe = _find_soffice(soffice_path)
         if not exe:
-            raise RuntimeError(
-                "LibreOffice(soffice) 실행파일을 찾지 못했습니다. "
-                "리눅스는 'libreoffice' 패키지 또는 AppImage, 윈도는 soffice.exe 경로를 --soffice_path로 넘기세요."
-            )
+            raise RuntimeError("LibreOffice(soffice)가 PATH에 없어요. 컨테이너에 설치되어 있어야 합니다.")
         with tempfile.TemporaryDirectory() as td:
             outdir = Path(td)
             cmd = [
@@ -167,10 +156,9 @@ def convert_to_images(input_path: Path, dpi: int = 200,
             if not pdf_path.exists():
                 raise RuntimeError(f"LibreOffice PDF 변환 실패: {input_path.name}")
             return pdf_to_images_pdf2image(pdf_path, dpi=dpi, poppler_path=poppler_path)
-    raise ValueError(f"지원하지 않는 파일 형식입니다: {ext}")
+    raise ValueError(f"지원하지 않는 파일 형식: {ext}")
 
-def run_ocr_text(reader: easyocr.Reader, image_pil: Image.Image,
-                 bbox_xyxy: Tuple[int, int, int, int]) -> str:
+def run_ocr_text(reader: easyocr.Reader, image_pil: Image.Image, bbox_xyxy: Tuple[int, int, int, int]) -> str:
     x1, y1, x2, y2 = bbox_xyxy
     crop = np.array(image_pil.crop((x1, y1, x2, y2)))  # HWC RGB
     try:
@@ -183,21 +171,16 @@ def scale_bbox_to_target(bbox_xyxy: np.ndarray, curr_wh: Tuple[int, int], target
     x1, y1, x2, y2 = bbox_xyxy.tolist()
     cw, ch = curr_wh
     tw, th = target_wh
-    sx = tw / float(cw)
-    sy = th / float(ch)
+    sx = tw / float(cw); sy = th / float(ch)
     X1 = int(round(x1 * sx)); Y1 = int(round(y1 * sy))
     X2 = int(round(x2 * sx)); Y2 = int(round(y2 * sy))
     return X1, Y1, X2, Y2
 
 def clamp_bbox(x1: int, y1: int, x2: int, y2: int, W: int, H: int) -> Tuple[int, int, int, int]:
-    x1 = max(0, min(int(x1), W - 1))
-    x2 = max(0, min(int(x2), W - 1))
-    y1 = max(0, min(int(y1), H - 1))
-    y2 = max(0, min(int(y2), H - 1))
-    if x2 < x1:
-        x1, x2 = x2, x1
-    if y2 < y1:
-        y1, y2 = y2, y1
+    x1 = max(0, min(int(x1), W - 1)); x2 = max(0, min(int(x2), W - 1))
+    y1 = max(0, min(int(y1), H - 1)); y2 = max(0, min(int(y2), H - 1))
+    if x2 < x1: x1, x2 = x2, x1
+    if y2 < y1: y1, y2 = y2, y1
     return x1, y1, x2, y2
 
 def assign_reading_order(dets: List[Det], page_w: int) -> None:
@@ -206,41 +189,40 @@ def assign_reading_order(dets: List[Det], page_w: int) -> None:
     centers = np.array([(d.x1 + d.x2) / 2 for d in dets], dtype=np.float32)
     xs = np.sort(centers)
     two_col = (len(xs) > 1 and np.max(np.diff(xs)) > 0.22 * page_w)
-
     if two_col:
         idx_sort = np.argsort(centers)
         gaps = np.diff(centers[idx_sort])
         split_pos = int(np.argmax(gaps)) + 1
-        left_idx = idx_sort[:split_pos]
-        right_idx = idx_sort[split_pos:]
+        left_idx = idx_sort[:split_pos]; right_idx = idx_sort[split_pos:]
         groups = [list(left_idx), list(right_idx)]
     else:
         groups = [list(range(len(dets)))]
-
     order = 0
     for g in groups:
         g_sorted = sorted(g, key=lambda i: (dets[i].y1, dets[i].x1))
         for i in g_sorted:
-            dets[i].order = order
-            order += 1
+            dets[i].order = order; order += 1
 
-# =====================
-# Inference core
-# =====================
-
-def detect_on_pil(model: YOLO, image_pil: Image.Image, imgsz: int, conf: float, iou: float,
-                  max_det: int, device: str | int, target_wh: Tuple[int, int],
-                  ocr_engine: Any) -> List[Det]:
+# ===================== 추론 =====================
+def detect_on_pil(
+    model: YOLO,
+    image_pil: Image.Image,
+    imgsz: int,
+    conf: float,
+    iou: float,
+    max_det: int,
+    device: str | int,
+    target_wh: Tuple[int, int],
+    ocr_engine: Any,
+) -> List[Det]:
     img_np = np.array(image_pil)  # RGB
     dev = normalize_device(device)
-    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det,
-                        device=dev, verbose=False)[0]
+    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, device=dev, verbose=False)[0]
 
     H, W = res.orig_shape
     boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.zeros((0, 4))
-    clss = res.boxes.cls.cpu().numpy().astype(int) if res.boxes is not None else np.zeros((0,), int)
+    clss  = res.boxes.cls.cpu().numpy().astype(int) if res.boxes is not None else np.zeros((0,), int)
     confs = res.boxes.conf.cpu().numpy().astype(float) if res.boxes is not None else np.zeros((0,), float)
-
     names = res.names if isinstance(res.names, dict) else {i: n for i, n in enumerate(res.names)}
 
     out: List[Det] = []
@@ -259,34 +241,39 @@ def detect_on_pil(model: YOLO, image_pil: Image.Image, imgsz: int, conf: float, 
     assign_reading_order(out, page_w=target_wh[0])
     return out
 
-# =====================
-# Main CLI
-# =====================
-
+# ===================== CLI =====================
 def main():
+    default_weights = BASE_DIR / "model" / "best.pt"
+    default_data = BASE_DIR / "data" / "test.csv"
+    default_out  = BASE_DIR / "output" / "submission.csv"
+
     p = argparse.ArgumentParser()
-    p.add_argument("--weights", required=True)
-    p.add_argument("--data_csv", default=str(Path(__file__).resolve().parent / "data" / "test.csv"))
-    p.add_argument("--out_csv", default=str(Path(__file__).resolve().parent / "output" / "submission.csv"))
+    p.add_argument("--weights", default=str(default_weights))
+    p.add_argument("--data_csv", default=str(default_data))
+    p.add_argument("--out_csv",  default=str(default_out))
     p.add_argument("--imgsz", type=int, default=896)
-    p.add_argument("--device", default="cpu")  # 'cpu' or 0 / 'cuda:0'
+    p.add_argument("--device", default=0)  # 도커 기본 CPU
     p.add_argument("--conf", type=float, default=0.25)
-    p.add_argument("--iou", type=float, default=0.6)
+    p.add_argument("--iou",  type=float, default=0.6)
     p.add_argument("--max_det", type=int, default=3000)
 
-    # 렌더 옵션
-    p.add_argument("--dpi", type=int, default=200, help="PDF/PPTX 렌더 DPI")
-    p.add_argument("--poppler_path", default="", help="Windows에서 poppler bin 경로 (리눅스는 보통 필요 없음)")
-    p.add_argument("--soffice_path", default="", help="LibreOffice soffice 실행파일 경로(없으면 PATH에서 탐색)")
+    # 렌더 옵션(리눅스 도커는 보통 poppler_path/soffice_path 불필요)
+    p.add_argument("--dpi", type=int, default=200)
+    p.add_argument("--poppler_path", default="")
+    p.add_argument("--soffice_path", default="")
 
-    # EasyOCR 옵션
+    # EasyOCR
     p.add_argument("--easyocr_langs", default="ko,en")
-    p.add_argument("--easyocr_model_dir", default="./easyocr_models")
-    p.add_argument("--easyocr_download", action="store_true", help="첫 실행시 가중치 다운로드 허용(온라인)")
-    p.add_argument("--easyocr_gpu", action="store_true", help="EasyOCR에서 GPU 사용")
+    p.add_argument("--easyocr_model_dir", default=str(BASE_DIR / "easyocr_models"))
+    p.add_argument("--easyocr_download", action="store_true")
+    p.add_argument("--easyocr_gpu", action="store_true")
+
+    # 후처리: 자동 시각화
+    p.add_argument("--auto_viz", action="store_true", help="끝나면 viz_boxes_poppler.py로 시각화(기본 off)")
 
     args = p.parse_args()
 
+    # 모델 & OCR
     model = load_yolo(Path(args.weights))
     ocr = init_easyocr(
         langs=args.easyocr_langs,
@@ -296,8 +283,7 @@ def main():
     )
 
     data_csv = Path(args.data_csv)
-    out_csv = Path(args.out_csv)
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_csv = Path(args.out_csv); out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(data_csv)
     need_cols = {"ID", "path", "width", "height"}
@@ -320,15 +306,13 @@ def main():
             continue
 
         try:
-            images = convert_to_images(file_path, dpi=args.dpi,
-                                       poppler_path=poppler, soffice_path=soffice)
+            images = convert_to_images(file_path, dpi=args.dpi, poppler_path=poppler, soffice_path=soffice)
         except Exception as e:
             print(f"[WARN] Convert failed: {file_path} -> {e}")
             continue
 
         for img in images:
-            dets = detect_on_pil(model, img, args.imgsz, args.conf, args.iou,
-                                 args.max_det, args.device, target_wh, ocr)
+            dets = detect_on_pil(model, img, args.imgsz, args.conf, args.iou, args.max_det, args.device, target_wh, ocr)
             dets.sort(key=lambda d: d.order if d.order >= 0 else 10**9)
             for d in dets:
                 rows.append(d.as_row(page_id))
@@ -339,6 +323,24 @@ def main():
         w.writerows(rows)
 
     print(f"[OK] wrote {len(rows)} rows -> {out_csv}")
+
+    # 자동 시각화 옵션
+    if args.auto_viz:
+        viz_py = BASE_DIR / "viz_boxes_poppler.py"
+        if viz_py.exists():
+            out_dir = BASE_DIR / "viz"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                subprocess.run(
+                    ["python", str(viz_py),
+                     "--data_csv", str(data_csv),
+                     "--pred_csv", str(out_csv),
+                     "--out_dir", str(out_dir)],
+                    check=True
+                )
+                print(f"[OK] viz saved -> {out_dir}")
+            except Exception as e:
+                print(f"[WARN] viz failed: {e}")
 
 if __name__ == "__main__":
     main()
