@@ -1,3 +1,9 @@
+2024 08-15
+Today, I tried training YOLOv11n.
+However, I think my first model was overfitted and didn’t perform well.
+The sample model actually produced better results than mine.
+I believe the main issue was the small size of the training dataset and overfitting due to a high number of epochs.
+
 2024.0813-14 (sam)
 Today, I learned how to use Docker.
 Now I can run my script in an environment identical to the competition site.
@@ -29,3 +35,4 @@ We need to find a better solution here . We have to identify the areas where imp
 We fine the issue . There are three types of boxes . and we curretly classify vehicles into multiple types to determine the minimum nmber of vehicles needed . however , the number of types-0 boxes that can be loaded into vehicles capacle of carrying type-0 boxes is significantly higher than the number of boxes of other types . Every multiple of 84 makes it easier for these vehicels to load type-0 boxes , but since 84 is large number , it seems that if we introduce more vehicle type that can a smaller number of type-0 boxes , we could achieve a more optimal solution .
 
 + We got second place.
+
