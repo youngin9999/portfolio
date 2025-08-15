@@ -2,7 +2,7 @@ from roboflow import Roboflow
 from ultralytics import YOLO
 
 model = YOLO(model='yolo11n.pt',task='detect')
-rf = Roboflow(api_key="LTYU5Wr6vTjeqXzk6n8G")
+rf = Roboflow(api_key="")
 project = rf.workspace("samsung-competition").project("my-first-project-9zbk7")
 version = project.version(2)
 dataset = version.download("yolov11")
