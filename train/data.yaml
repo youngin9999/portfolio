@@ -5,6 +5,8 @@ test: /workspace/train/v1data/test
 nc: 6
 names: ['image', 'pagenumber', 'subtitle', 'table', 'text', 'title']
 
+
+
 roboflow:
   workspace: samsung-competition
   project: my-first-project-9zbk7

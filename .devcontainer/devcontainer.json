@@ -2,7 +2,8 @@
   "name": "VRDU",
   "image": "vrdu:cu12",
   "runArgs": ["--gpus","all","--shm-size=4g","--ipc=host"],
-  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "workspaceMount": "source=ws,type=volume,target=/workspace",
   "workspaceFolder": "/workspace",
+  "postCreateCommand": "git clone <repo> . || true",
   "customizations": { "vscode": { "extensions": ["ms-python.python","ms-toolsai.jupyter"] } }
 }

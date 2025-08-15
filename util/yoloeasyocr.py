@@ -243,7 +243,7 @@ def detect_on_pil(
 
 # ===================== CLI =====================
 def main():
-    default_weights = BASE_DIR / "model" / "best.pt"
+    default_weights = BASE_DIR / "model" / "last.pt"
     default_data = BASE_DIR / "data" / "test.csv"
     default_out  = BASE_DIR / "output" / "submission.csv"
 
