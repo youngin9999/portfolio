@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
-from ultralytics import YOLO
+from doclayout_yolo import YOLOv10
 
 # 선택: PyMuPDF 임포트 시도(폴백용 아님, 설치여부만 허용)
 try:
@@ -44,12 +44,16 @@ TEXT_CATS = {"title", "subtitle", "text"}
 
 # YOLO 클래스명 정규화(가중치가 DocLayNet 라벨이라 가정)
 NAME_CANON = {
-    "Text": "text",
-    "Title": "title",
-    "Section-header": "subtitle",
-    "Formula": "equation",
-    "Table": "table",
-    "Picture": "image",
+    "title": "title",
+    "plain text": "text",
+    "figure": "image",
+    "table": "table",
+    "isolated formula": "equation",
+    "figure caption": "text",
+    "table caption": "text",
+    "formula caption": "text",
+    "table footnote": "text",     # 후처리로 소형/하단은 드롭
+    "abandoned text": None, 
 }
 
 BASE_DIR = Path(__file__).resolve().parent  # util/
@@ -77,6 +81,13 @@ class Det:
         )
 
 # ===================== 유틸 =====================
+def remap_label(raw_name: str) -> str | None:
+    """원본 라벨을 우리 기준으로 변환. None이면 제출에서 제외."""
+    mapped = NAME_CANON.get(raw_name, raw_name)
+    if mapped is None:
+        return None
+    mapped = str(mapped).lower().strip()
+    return mapped if mapped in CATEGORY_NAMES else None
 def normalize_device(dev):
     s = str(dev).lower()
     if s in {"cpu", "-1"}:
@@ -88,7 +99,7 @@ def normalize_device(dev):
     return "cpu"
 
 def load_yolo(weights: Path):
-    return YOLO(str(weights))
+    return YOLOv10(str(weights))
 
 def init_easyocr(
     langs: str = "ko,en",
@@ -205,7 +216,7 @@ def assign_reading_order(dets: List[Det], page_w: int) -> None:
 
 # ===================== 추론 =====================
 def detect_on_pil(
-    model: YOLO,
+    model: YOLOv10,
     image_pil: Image.Image,
     imgsz: int,
     conf: float,
@@ -228,9 +239,9 @@ def detect_on_pil(
     out: List[Det] = []
     for box, cls, cf in zip(boxes, clss, confs):
         raw = str(names.get(int(cls), int(cls)))
-        name = NAME_CANON.get(raw, raw.lower())
-        if name not in CATEGORY_NAMES:
-            continue
+        name = remap_label(raw)
+        if name is None:
+            continue  # Abandoned Text 등은 버림
         x1, y1, x2, y2 = scale_bbox_to_target(box, (W, H), target_wh)
         x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, *target_wh)
         det = Det(name, float(cf), x1, y1, x2, y2)
@@ -243,7 +254,7 @@ def detect_on_pil(
 
 # ===================== CLI =====================
 def main():
-    default_weights = BASE_DIR / "model" / "last.pt"
+    default_weights = BASE_DIR / "model" / "doclayout_yolo_docstructbench_imgsz1024.pt"
     default_data = BASE_DIR / "data" / "test.csv"
     default_out  = BASE_DIR / "output" / "submission.csv"
 
@@ -276,12 +287,12 @@ def main():
     # 모델 & OCR
     model = load_yolo(Path(args.weights))
     ocr = init_easyocr(
-        langs=args.easyocr_langs,
+        langs=args.easyocr_langs, 
         model_dir=args.easyocr_model_dir,
         download=args.easyocr_download,
         gpu=bool(args.easyocr_gpu),
     )
-
+  
     data_csv = Path(args.data_csv)
     out_csv = Path(args.out_csv); out_csv.parent.mkdir(parents=True, exist_ok=True)
 
