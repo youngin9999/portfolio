@@ -1,3 +1,10 @@
+2024 08-25
+
+github's open model is better than mine.
+
+I should start ocr by using tesseract.
+
+ 
 2024 08-15
 Today, I tried training YOLOv11n.
 However, I think my first model was overfitted and didn’t perform well.

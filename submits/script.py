@@ -228,7 +228,7 @@ def detect_on_pil(
 ) -> List[Det]:
     img_np = np.array(image_pil)  # RGB
     dev = normalize_device(device)
-    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, device=dev, verbose=False)[0]
+    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, verbose=False)[0]
 
     H, W = res.orig_shape
     boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.zeros((0, 4))
@@ -275,7 +275,7 @@ def main():
 
     # EasyOCR
     p.add_argument("--easyocr_langs", default="ko,en")
-    p.add_argument("--easyocr_model_dir", default=str(BASE_DIR / "easyocr_models"))
+    p.add_argument("--easyocr_model_dir", default=str(BASE_DIR /"model" / "ocr" ))
     p.add_argument("--easyocr_download", action="store_true")
     p.add_argument("--easyocr_gpu", action="store_true")
 
