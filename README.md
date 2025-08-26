@@ -1,3 +1,11 @@
+
+2024 08- 27
+
+Today I dug into the evaluation logic—IoU, mAP, NED, and reading order—and learned how each impacts the score.
+I cleanly mapped DocLayout-YOLO labels to the contest’s six classes, refined reading-order rules (auto 1/2-column), and tightened the pipeline.
+I audited environment dependencies (Poppler, LibreOffice, doclayout-yolo) and path issues, confirming root causes of the errors one by one.
+Finally, I swapped EasyOCR for Tesseract, built a runnable script.py, and finished a setup that outputs a submission-ready submission.csv.
+
 2024 08-25
 
 github's open model is better than mine.
