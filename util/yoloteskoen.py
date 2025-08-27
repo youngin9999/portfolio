@@ -7,8 +7,9 @@ script.py  —  Document layout + OCR (Tesseract) → submission.csv
 - PPTX: LibreOffice(soffice) → PDF → 이미지
 - doclayout-yolo 있으면 사용, 없으면 ultralytics YOLO 폴백
 """
-
 from __future__ import annotations
+from pytesseract import Output
+import cv2
 import argparse
 import csv
 import os
@@ -19,7 +20,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Tuple
-
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -50,6 +50,8 @@ except Exception:
 # ===================== Settings / Mappings =====================
 CATEGORY_NAMES = ["title", "subtitle", "text", "image", "table", "equation"]
 TEXT_CATS = {"title", "subtitle", "text"}
+_HANGUL_RE = re.compile(r'[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]')
+_LATIN_RE  = re.compile(r'[A-Za-z]')
 
 # doclayout-yolo 원본 라벨을 우리 6클래스로
 _RAW2CANON = {
@@ -98,26 +100,23 @@ class Det:
             self.text,
             bbox_str,
         )
+# ===== OCR ONLY (Tesseract, KO+EN 혼합 개선) =====
 
+def _contains_hangul(s: str) -> bool: return bool(_HANGUL_RE.search(s))
+def _contains_latin(s: str) -> bool:  return bool(_LATIN_RE.search(s))
 
-# ===================== OCR (Tesseract) =====================
 @dataclass
 class TesseractCfg:
-    lang: str = "eng"   # e.g., "kor+eng"
-    oem: int = 3        # 3: LSTM
-    psm: int = 6        # 6: uniform block
-    extra: str = ""     # 추가 옵션
+    lang: str = "kor+eng"  # 기본 혼합
+    oem: int = 3           # LSTM
+    psm: int = 6           # 균일 블록 가정
+    extra: str = ""        # 추가 옵션
     tesseract_cmd: str | None = None
 
 def _langs_to_tesseract_code(langs: str) -> str:
-    m = {
-        "ko": "kor", "kor": "kor", "korean": "kor",
-        "en": "eng", "eng": "eng", "english": "eng",
-        "ja": "jpn", "zh": "chi_sim",
-    }
+    m = {"ko":"kor","kor":"kor","korean":"kor","en":"eng","eng":"eng","english":"eng"}
     parts = [p.strip().lower() for p in (langs or "eng").split(",") if p.strip()]
-    mapped = [m.get(p, p) for p in parts]
-    return "+".join(mapped) if mapped else "eng"
+    return "+".join(m.get(p, p) for p in parts) if parts else "eng"
 
 def init_ocr(langs="ko,en", tesseract_cmd="", oem=3, psm=6, extra="") -> TesseractCfg:
     cfg = TesseractCfg(lang=_langs_to_tesseract_code(langs), oem=int(oem), psm=int(psm), extra=str(extra))
@@ -126,19 +125,120 @@ def init_ocr(langs="ko,en", tesseract_cmd="", oem=3, psm=6, extra="") -> Tessera
         cfg.tesseract_cmd = tesseract_cmd
     return cfg
 
-def run_ocr_text(reader: TesseractCfg, image_pil: Image.Image, bbox_xyxy: Tuple[int, int, int, int]) -> str:
+# ---- 전처리(업스케일 + 적응형 이진화 + 약한 샤프닝)
+def _preproc_pil(pil: Image.Image) -> Image.Image:
+    img = np.array(pil)
+    g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    h, w = g.shape
+    scale = 2.0 if max(h, w) < 800 else 1.5 if max(h, w) < 1400 else 1.0
+    if scale != 1.0:
+        g = cv2.resize(g, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    g = cv2.bilateralFilter(g, 7, 10, 10)
+    bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 15)
+    k = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]], np.float32)
+    bw = cv2.filter2D(bw, -1, k)
+    return Image.fromarray(bw)
+
+def _strip_spaces(s: str) -> str:
+    return " ".join(s.split())
+
+def _ocr_pass_image_to_string(crop: Image.Image, lang: str, oem: int, psm: int,
+                              extra_cfg: str = "", whitelist: str | None = None) -> str:
+    cfgs = [f"--oem {int(oem)}", f"--psm {int(psm)}", "-c preserve_interword_spaces=1"]
+    if whitelist:
+        cfgs.append(f"-c tessedit_char_whitelist={whitelist}")
+    if extra_cfg:
+        cfgs.append(extra_cfg)
+    config = " ".join(cfgs)
+    out = pytesseract.image_to_string(crop, lang=lang, config=config)
+    return _strip_spaces(out)
+
+def _ocr_data_words(crop: Image.Image, lang: str, oem: int, psm: int,
+                    extra_cfg: str = "", whitelist: str | None = None):
+    cfgs = [f"--oem {int(oem)}", f"--psm {int(psm)}", "-c preserve_interword_spaces=1"]
+    if whitelist:
+        cfgs += [f"-c tessedit_char_whitelist={whitelist}",
+                 "-c load_system_dawg=0", "-c load_freq_dawg=0"]
+    if extra_cfg:
+        cfgs.append(extra_cfg)
+    config = " ".join(cfgs)
+    data = pytesseract.image_to_data(crop, lang=lang, config=config, output_type=Output.DICT)
+    words = []
+    for i, txt in enumerate(data["text"]):
+        txt = (txt or "").strip()
+        if not txt: continue
+        conf = int(data["conf"][i]) if str(data["conf"][i]).isdigit() else -1
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        words.append({"text": txt, "conf": conf, "bbox": (x, y, x+w, y+h)})
+    return words
+
+def _fix_ascii_token(tok: str) -> str:
+    letters = [c for c in tok if c.isalpha()]
+    if not letters: return tok
+    upp = sum(1 for c in letters if c.isupper())
+    if upp / max(1, len(letters)) >= 0.6:
+        tok = tok.replace('!', 'I')
+        if re.search(r'[A-Za-z]0[A-Za-z]', tok): tok = tok.replace('0', 'O')
+        tok = re.sub(r'(^|[^a-z])l(?=[A-Z]|$)', r'\1I', tok)
+    return tok
+
+def _key(w): 
+        (x1, y1, x2, y2) = w["bbox"]; return (y1, x1)
+
+
+def _merge_tokens(eng_words, kor_words) -> str:
+    merged = []
+    i = j = 0
+    while i < len(eng_words) or j < len(kor_words):
+        ew = eng_words[i] if i < len(eng_words) else None
+        kw = kor_words[j] if j < len(kor_words) else None
+        pick_from = "eng" if ew and (not kw or _key(ew) <= _key(kw)) else "kor"
+        pick = ew if pick_from == "eng" else kw
+        if not pick: break
+        t = pick["text"]
+        if _contains_hangul(t) and kw:
+            t = kw["text"] if kw["conf"] >= (ew["conf"] if ew else -1) else t
+        elif _contains_latin(t) and ew:
+            t = _fix_ascii_token(ew["text"] if ew["conf"] >= (kw["conf"] if kw else -1) else t)
+        merged.append(t)
+        if pick_from == "eng": i += 1
+        else: j += 1
+    s = " ".join(merged)
+    s = re.sub(r'\s+([,.:;)\]])', r'\1', s)
+    s = re.sub(r'([(\[])\s+', r'\1', s)
+    return s.strip()
+
+def run_ocr_text(reader: TesseractCfg, image_pil: Image.Image, bbox_xyxy) -> str:
     x1, y1, x2, y2 = map(int, bbox_xyxy)
     crop = image_pil.crop((x1, y1, x2, y2))
-    config = f"--oem {reader.oem} --psm {reader.psm}"
-    if reader.extra:
-        config = f"{config} {reader.extra}"
     try:
-        text = pytesseract.image_to_string(crop, lang=reader.lang, config=config)
-        text = " ".join(t.strip() for t in text.splitlines() if t.strip())
-        return text
+        crop = _preproc_pil(crop)
     except Exception:
-        return ""
+        pass
 
+    # 1) 혼합 한 번 (참고값)
+    base = _ocr_pass_image_to_string(
+        crop, lang=getattr(reader, "lang", "kor+eng") or "kor+eng",
+        oem=getattr(reader, "oem", 3), psm=getattr(reader, "psm", 6),
+        extra_cfg=getattr(reader, "extra", "") or ""
+    )
+    # 2) 영어/한국어 별도 패스(단어/신뢰도)
+    eng_words = _ocr_data_words(
+        crop, lang="eng", oem=getattr(reader, "oem", 3), psm=6,
+        whitelist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-+&/#():%.,"
+    )
+    kor_words = _ocr_data_words(
+        crop, lang="kor", oem=getattr(reader, "oem", 3), psm=6
+    )
+    mixed = _merge_tokens(eng_words, kor_words)
+
+    has_h = _contains_hangul(base) or any(_contains_hangul(w["text"]) for w in kor_words)
+    has_l = _contains_latin(base)  or any(_contains_latin(w["text"]) for w in eng_words)
+    if has_h and has_l: return mixed or base
+    if has_h:           return " ".join(w["text"] for w in kor_words) or base
+    if has_l:           return " ".join(_fix_ascii_token(w["text"]) for w in eng_words) or base
+    return mixed or base
 
 # ===================== Utilities =====================
 BASE_DIR = Path(__file__).resolve().parent
