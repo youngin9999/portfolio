@@ -64,6 +64,7 @@ except Exception:
 # ===================== Settings / Mappings =====================
 CATEGORY_NAMES = ["title", "subtitle", "text", "image", "table", "equation"]
 TEXT_CATS = {"title", "subtitle", "text"}
+NON_TEXT_CATS = {"image", "table", "equation"}
 BASE_DIR = Path(__file__).resolve().parent
 
 # doclayout-yolo 원본 라벨을 우리 6클래스로
@@ -145,82 +146,100 @@ def paddle_ocr_full(engine: PaddleOCREngine, image_pil: Image.Image) -> List[Dic
     반환: [{"text":str,"score":float,"poly":np.ndarray(4,2),"bbox":(x1,y1,x2,y2),"cx":..,"cy":..}, ...]
     """
     arr = np.array(image_pil.convert("RGB"))
-    result = engine.ocr.predict(input=arr) 
-    for res1 in result:  
-        res1.print()  
-        res1.save_to_img("output")  
-        res1.save_to_json("output") # predict로 호출 (cls 인자 없음)   << 이 for문도 나중에 주석처리
+    result = engine.ocr.predict(input=arr)
+    # 디버그용 출력은 필요 시 유지
+    # for res1 in result:
+    #     res1.print(); res1.save_to_img("output"); res1.save_to_json("output")
+
     if not result:
         return []
     res = result[0]
 
     lines: List[Dict[str, Any]] = []
-    # paddlex 결과 객체 표준 경로
+
+    # ── (A) PaddleOCR 3.x 표준 포맷: res.json['res'] 에서 파싱 ──
+    data = getattr(res, "json", None)
+    if isinstance(data, dict):
+        data = data.get("res", data)
+
+        rec_texts  = data.get("rec_texts")   # list[str]
+        rec_scores = data.get("rec_scores")  # list/np.array[float]
+        rec_polys  = data.get("rec_polys")   # np.array [N,4,2] (있으면 이걸 우선)
+        rec_boxes  = data.get("rec_boxes")   # np.array [N,4]   (fallback)
+
+        if rec_texts is not None:
+            rec_scores = np.asarray(rec_scores).tolist() if rec_scores is not None else [0.0]*len(rec_texts)
+
+            if rec_polys is not None:
+                # 다각형 기반 (권장)
+                polys = np.asarray(rec_polys, dtype=float)  # (N,4,2)
+                for txt, score, poly in zip(rec_texts, rec_scores, polys):
+                    txt = (txt or "").strip()
+                    if not txt: continue
+                    x1, y1 = float(poly[:,0].min()), float(poly[:,1].min())
+                    x2, y2 = float(poly[:,0].max()), float(poly[:,1].max())
+                    lines.append({
+                        "text": txt, "score": float(score), "poly": poly.astype(float),
+                        "bbox": (x1, y1, x2, y2), "cx": float(poly[:,0].mean()), "cy": float(poly[:,1].mean())
+                    })
+                return lines
+
+            if rec_boxes is not None:
+                # 사각 박스 기반 (폴리곤 없을 때 대체)
+                boxes = np.asarray(rec_boxes, dtype=float)  # (N,4) 가정: [x1,y1,x2,y2]
+                for txt, score, box in zip(rec_texts, rec_scores, boxes):
+                    txt = (txt or "").strip()
+                    if not txt: continue
+                    x1, y1, x2, y2 = map(float, box)
+                    cx, cy = (x1+x2)/2.0, (y1+y2)/2.0
+                    poly = np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=float)
+                    lines.append({
+                        "text": txt, "score": float(score), "poly": poly,
+                        "bbox": (x1, y1, x2, y2), "cx": cx, "cy": cy
+                    })
+                return lines
+        # 여기까지 왔는데도 못 꺼냈다면 (B)로 폴백
+
+    # ── (B) 다른 포맷(예: res.ocr_info / 구식 list 포맷) 폴백 ──
     if hasattr(res, "ocr_info") and res.ocr_info:
         for it in res.ocr_info:
             txt = (it.get("text") or it.get("transcription") or "").strip()
+            if not txt: continue
             score = float(it.get("score", 0.0))
-            poly = it.get("box") or it.get("points")  # [[x,y], ...] 4점
-            if not txt or not poly:
-                continue
+            poly  = it.get("box") or it.get("points")
+            if not poly: continue
             poly = np.array(poly, dtype=float)
-            x1, y1 = poly[:,0].min(), poly[:,1].min()
-            x2, y2 = poly[:,0].max(), poly[:,1].max()
+            x1, y1 = float(poly[:,0].min()), float(poly[:,1].min())
+            x2, y2 = float(poly[:,0].max()), float(poly[:,1].max())
             lines.append({
-                "text": txt,
-                "score": score,
-                "poly": poly,                   # 4점 폴리곤
-                "bbox": (float(x1), float(y1), float(x2), float(y2)),  # AABB
-                "cy": float(poly[:,1].mean()),
-                "cx": float(poly[:,0].mean())
+                "text": txt, "score": score, "poly": poly,
+                "bbox": (x1, y1, x2, y2), "cx": float(poly[:,0].mean()), "cy": float(poly[:,1].mean())
             })
-    else:
-        # 구형 포맷 대비 (list of [points, (text, conf)])
-        if isinstance(res, list):
-            for line in res:
-                if not (isinstance(line, list) and len(line) > 1):
-                    continue
-                txt, conf = str(line[1][0]).strip(), float(line[1][1])
-                pts = np.array(line[0], dtype=float)
-                if txt and pts.size:
-                    x1, y1 = pts[:,0].min(), pts[:,1].min()
-                    x2, y2 = pts[:,0].max(), pts[:,1].max()
-                    lines.append({
-                        "text": txt, "score": conf, "poly": pts,
-                        "bbox": (float(x1), float(y1), float(x2), float(y2)),
-                        "cy": float(pts[:,1].mean()), "cx": float(pts[:,0].mean())
-                    })
+        return lines
+
+    # ── (C) 구버전 legacy 리스트 포맷 폴백 ──
+    if isinstance(res, list):  # e.g., [[points, (text, conf)], ...]
+        for line in res:
+            if not (isinstance(line, list) and len(line) > 1):
+                continue
+            txt, conf = str(line[1][0]).strip(), float(line[1][1])
+            pts = np.array(line[0], dtype=float)
+            if txt and pts.size:
+                x1, y1 = float(pts[:,0].min()), float(pts[:,1].min())
+                x2, y2 = float(pts[:,0].max()), float(pts[:,1].max())
+                lines.append({
+                    "text": txt, "score": conf, "poly": pts,
+                    "bbox": (x1, y1, x2, y2), "cx": float(pts[:,0].mean()), "cy": float(pts[:,1].mean())
+                })
+        return lines
+
     return lines
 
 
 # ===================== Helpers: IoU / Center / Distance =====================
-def iou_xyxy(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -> float:
-    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
-    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
-    inter = iw * ih
-    if inter <= 0: return 0.0
-    aarea = max(0.0, (ax2-ax1)) * max(0.0, (ay2-ay1))
-    barea = max(0.0, (bx2-bx1)) * max(0.0, (by2-by1))
-    return inter / max(1e-6, aarea + barea - inter)
-
-def center_in(a_xyxy: Tuple[float,float,float,float], cx: float, cy: float, margin: float=0.0) -> bool:
-    x1, y1, x2, y2 = a_xyxy
-    return (cx >= x1-margin) and (cx <= x2+margin) and (cy >= y1-margin) and (cy <= y2+margin)
-
-def center_distance(a_xyxy: Tuple[float,float,float,float], cx: float, cy: float) -> float:
-    x1, y1, x2, y2 = a_xyxy
-    rx, ry = (x1+x2)/2.0, (y1+y2)/2.0
-    return ((rx-cx)**2 + (ry-cy)**2) ** 0.5
 
 
 # ===================== Detection (YOLO) =====================
-def normalize_device(dev):
-    s = str(dev).lower()
-    if s in {"cpu", "-1"}: return "cpu"
-    if s.startswith("cuda"): return s
-    if s.isdigit(): return int(s)
-    return "cpu"
 
 def load_model(weights: Path):
     model = _YOLO(str(weights))
@@ -234,12 +253,10 @@ def detect_regions(
     conf: float,
     iou: float,
     max_det: int,
-    device: str | int,
 ) -> Tuple[List[Det], Tuple[int,int]]:
     """YOLO로 레이아웃 영역 감지 → Det 리스트와 (W,H) 반환 (박스는 현재 이미지 좌표계)"""
     img_np = np.array(image_pil)  # RGB
-    dev = normalize_device(device)
-    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, device=dev, verbose=False)[0]
+    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, verbose=False)[0]
 
     H, W = res.orig_shape
     boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.zeros((0, 4))
@@ -259,59 +276,89 @@ def detect_regions(
 
 
 # ===================== Merge OCR Lines into YOLO Regions =====================
-def merge_ocr_with_layout(
-    lines: List[Dict[str,Any]],
-    dets: List[Det],
-    margin: int = 6,
-    iou_thr: float = 0.12
-) -> None:
-    """
-    dets를 제자리에서 수정(det.text 채움).
-    매칭 규칙: 중심점 포함(마진) → IoU 최대(임계) → 중심거리 최소
-    라인 정렬: 영역 내 y→x 순
-    """
-    # 1) 라인을 각 det에 배정
-    assigned: Dict[int, List[Dict[str,Any]]] = {i: [] for i in range(len(dets))}
-    for ln in lines:
-        best = None  # (idx, flag, metric)
-        # 1) 중심점 포함
-        for idx, d in enumerate(dets):
-            if center_in((d.x1,d.y1,d.x2,d.y2), ln["cx"], ln["cy"], margin=margin):
-                best = (idx, 1.0, 0.0)
-                break
-        # 2) IoU 최대
-        if best is None:
-            max_iou, best_idx = 0.0, None
-            for idx, d in enumerate(dets):
-                iou = iou_xyxy(ln["bbox"], (d.x1,d.y1,d.x2,d.y2))
-                if iou > max_iou:
-                    max_iou, best_idx = iou, idx
-            if max_iou >= iou_thr and best_idx is not None:
-                best = (best_idx, 0.0, max_iou)
-        # 3) 거리 최소
-        if best is None:
-            dmin, best_idx = 1e18, None
-            lcx, lcy = ln["cx"], ln["cy"]
-            for idx, d in enumerate(dets):
-                rx, ry = (d.x1+d.x2)/2.0, (d.y1+d.y2)/2.0
-                dd = ((rx-lcx)**2 + (ry-lcy)**2) ** 0.5
-                if dd < dmin:
-                    dmin, best_idx = dd, idx
-            if best_idx is not None:
-                best = (best_idx, -1.0, -1.0)
-        if best is not None:
-            assigned[best[0]].append(ln)
+def _iou(a: Tuple[float,float,float,float], b: Tuple[float,float,float,float]) -> float:
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    if inter <= 0: return 0.0
+    aa = max(0.0, (ax2-ax1)) * max(0.0, (ay2-ay1))
+    ba = max(0.0, (bx2-bx1)) * max(0.0, (by2-by1))
+    return inter / max(1e-6, aa + ba - inter)
 
-    # 2) det.text 채우기 (y→x 정렬)
-    for idx, d in enumerate(dets):
-        seg = assigned.get(idx, [])
-        if not seg:
+def _coverage(line_bbox, reg_bbox):
+    # 라인 박스가 영역(reg)에 '얼마나' 들어가 있는지 (line 기준)
+    ax1, ay1, ax2, ay2 = line_bbox; bx1, by1, bx2, by2 = reg_bbox
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    la = max(1e-6, (ax2-ax1) * (ay2-ay1))
+    return inter / la
+
+def _center_in(reg_bbox, cx, cy, margin=0):
+    x1, y1, x2, y2 = reg_bbox
+    return (cx >= x1 - margin) and (cx <= x2 + margin) and (cy >= y1 - margin) and (cy <= y2 + margin)
+
+def merge_ocr_with_layout(
+    lines: List[Dict[str, Any]],
+    dets: List["Det"],
+    *,
+    center_margin: int = 6,
+    coverage_thr: float = 0.50,
+    iou_thr: float = 0.20,
+    y_bucket: int = 8
+) -> None:
+    print(f"[MERGE] dets={len(dets)}, lines={len(lines)}", flush=True)
+    if not dets or not lines:
+        return
+
+    # 비텍스트 박스는 확실히 비우기
+    for d in dets:
+        if d.cls_name in NON_TEXT_CATS:
+            d.text = ""
+
+    # 텍스트 박스만 순회
+    for d in dets:
+        if d.cls_name not in TEXT_CATS:
+            continue
+
+        reg = (d.x1, d.y1, d.x2, d.y2)
+        assigned = []
+
+        for ln in lines:
+            lb = ln.get("bbox")
+            if not lb or "cx" not in ln or "cy" not in ln or "text" not in ln:
+                continue
+            lcx, lcy = float(ln["cx"]), float(ln["cy"])
+
+            # (a) 중심 포함(+동적 마진: 라인 높이 0.5×)
+            lh = max(1.0, lb[3] - lb[1])
+            dyn_margin = max(center_margin, int(lh * 0.5))
+            ok = _center_in(reg, lcx, lcy, margin=dyn_margin)
+
+            # (b) 라인 포함율
+            if not ok and _coverage(lb, reg) >= coverage_thr:
+                ok = True
+
+            # (c) IoU
+            if not ok and _iou(lb, reg) >= iou_thr:
+                ok = True
+
+            if ok:
+                assigned.append(ln)
+
+        print(f"[MERGE] det({d.cls_name}) {reg} -> assign {len(assigned)} lines", flush=True)
+
+        if not assigned:
             d.text = ""
             continue
-        seg_sorted = sorted(seg, key=lambda t: (round(t["cy"]/8)*8, t["cx"]))
-        d.text = " ".join([t["text"] for t in seg_sorted]).strip()
 
+        assigned.sort(key=lambda t: (round(float(t["cy"]) / y_bucket) * y_bucket, float(t["cx"])))
+        merged = " ".join([t["text"].strip() for t in assigned if t.get("text") and t["text"].strip()])
+        d.text = merged.strip()
+        print(f"[MERGE] det({d.cls_name}) text_len={len(d.text)}", flush=True)
 
+    
 # ===================== Misc Utils =====================
 def scale_bbox_to_target(bbox_xyxy: Tuple[int,int,int,int], curr_wh: Tuple[int, int], target_wh: Tuple[int, int]) -> Tuple[int, int, int, int]:
     x1, y1, x2, y2 = bbox_xyxy
@@ -349,9 +396,6 @@ def assign_reading_order(dets: List[Det], page_w: int) -> None:
         g_sorted = sorted(g, key=lambda i: (dets[i].y1, dets[i].x1))
         for i in g_sorted:
             dets[i].order = order; order += 1
-
-def _has_cmd(name: str) -> bool:
-    return shutil.which(name) is not None
 
 def pdf_to_images(pdf_path: Path, dpi: int, poppler_path: str | None) -> List[Image.Image]:
     # pdf2image (Poppler) 1차 시도
@@ -412,8 +456,7 @@ def main():
     ap.add_argument("--weights", default=str(default_weights))
     ap.add_argument("--data_csv", default=str(default_data))
     ap.add_argument("--out_csv",  default=str(default_out))
-    ap.add_argument("--imgsz", type=int, default=896)
-    ap.add_argument("--device", default="cpu")  # 안전 기본값
+    ap.add_argument("--imgsz", type=int, default=1024)
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou",  type=float, default=0.6)
     ap.add_argument("--max_det", type=int, default=3000)
@@ -468,23 +511,25 @@ def main():
         for img in images:
             # 1) 전체 페이지 OCR (한 번만)
             lines = paddle_ocr_full(ocr_engine, img)
-            print(lines)                            ### 나중에 주석처리 << 여기까지 정상작동 확인 
+            print(f"lines = {lines}")                            ### 나중에 주석처리 << 여기까지 정상작동 확인 
             # 2) YOLO 레이아웃 감지
-            dets, curr_wh = detect_regions(model, img, args.imgsz, args.conf, args.iou, args.max_det, args.device)
-
+            dets, curr_wh = detect_regions(model, img, args.imgsz, args.conf, args.iou, args.max_det)
+            # print(dets)                                          ###### 이것도 확인 후 주석처리
             # 3) 라인 ↔ 영역 병합
-            merge_ocr_with_layout(lines, dets, margin=6, iou_thr=0.12)
 
+
+            merge_ocr_with_layout( lines, dets)
+            print(f"=====final dets1 = {dets}")
             # 4) 순서 부여(두 단 고려)
             assign_reading_order(dets, page_w=curr_wh[0])
-
+            print(f"=====final dets2 = {dets}")
             # 5) 출력(제출 포맷) — bbox를 타깃 해상도로 스케일
             for d in dets:
                 X1, Y1, X2, Y2 = scale_bbox_to_target((d.x1, d.y1, d.x2, d.y2), curr_wh, target_wh)
                 X1, Y1, X2, Y2 = clamp_bbox(X1, Y1, X2, Y2, *target_wh)
                 bbox_str = f"{X1}, {Y1}, {X2}, {Y2}"
                 rows.append((page_id, d.cls_name, round(float(d.conf), 6), int(d.order if d.order >= 0 else 0), d.text, bbox_str))
-
+            print(f"rows = {rows}")
     with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["ID", "category_type", "confidence_score", "order", "text", "bbox"])
