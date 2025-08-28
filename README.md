@@ -1,25 +1,32 @@
+2025 08 29
 
-2024 08- 27
+We replaced Tesseract with PaddleOCR (PP-OCRv5, Korean) and changed the flow to one full-page OCR → merge with YOLO layout. 
+This improved mixed Korean+English accuracy, reduced per-ROI OCR calls, and tried to fix text leaking. 
+The entry point is yolopad.py.
+
+
+
+2025 08- 27
 
 Today I dug into the evaluation logic—IoU, mAP, NED, and reading order—and learned how each impacts the score.
 I cleanly mapped DocLayout-YOLO labels to the contest’s six classes, refined reading-order rules (auto 1/2-column), and tightened the pipeline.
 I audited environment dependencies (Poppler, LibreOffice, doclayout-yolo) and path issues, confirming root causes of the errors one by one.
 Finally, I swapped EasyOCR for Tesseract, built a runnable script.py, and finished a setup that outputs a submission-ready submission.csv.
 
-2024 08-25
+2025 08-25
 
 github's open model is better than mine.
 
 I should start ocr by using tesseract.
 
  
-2024 08-15
+2025 08-15
 Today, I tried training YOLOv11n.
 However, I think my first model was overfitted and didn’t perform well.
 The sample model actually produced better results than mine.
 I believe the main issue was the small size of the training dataset and overfitting due to a high number of epochs.
 
-2024.0813-14 (sam)
+2025.0813-14 (sam)
 Today, I learned how to use Docker.
 Now I can run my script in an environment identical to the competition site.
 
@@ -33,7 +40,7 @@ Now I can run my script in an environment identical to the competition site.
 
 4. Design the order-setting logic.
 
-2024.0807 (samsung competition)
+2025.0807 (samsung competition)
 
 This competition is in the AI domain. , We need to build a model that imitates how humans read text and interpret images. So I plan to research OCR, how humans actually read, and how the areas of the brain responsible for reading function.
 Today, I just planned my schedule and logic First, I will perform OCR to detect texts and images, and classify them into categories.

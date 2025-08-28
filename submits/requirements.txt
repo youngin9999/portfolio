@@ -1,2 +1,4 @@
 
 doclayout_yolo==0.0.4
+paddlepaddle
+paddleocr
