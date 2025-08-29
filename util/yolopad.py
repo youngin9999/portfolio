@@ -65,6 +65,7 @@ except Exception:
 CATEGORY_NAMES = ["title", "subtitle", "text", "image", "table", "equation"]
 TEXT_CATS = {"title", "subtitle", "text"}
 NON_TEXT_CATS = {"image", "table", "equation"}
+_LABEL_PRI = {"title": 3, "subtitle": 2, "text" : 1}
 BASE_DIR = Path(__file__).resolve().parent
 
 # doclayout-yolo 원본 라벨을 우리 6클래스로
@@ -235,9 +236,104 @@ def paddle_ocr_full(engine: PaddleOCREngine, image_pil: Image.Image) -> List[Dic
 
     return lines
 
+# ================중복제거 , yolo 박스병합 =====================
+def dedup_text_overlaps(
+    dets: list,
+    iou_thr: float = 0.90,      # 거의 같은 위치일 때 IoU 기준
+    cover_thr: float = 0.95,    # 상호 포괄 비율(라인 기준 coverage) 기준
+    center_margin: int = 6      # 중심 상호 포함 여유(px)
+) -> list:
+    """
+    같은 위치로 중복된 텍스트계 박스(title/subtitle/text)는 1개만 남긴다.
+    - 기준: IoU≥iou_thr OR (A in B ≥cover_thr AND B in A ≥cover_thr) OR 중심 상호 포함
+    - 선택: 라벨 우선순위(title>subtitle>text) → conf 큰 것
+    - 이미지/표/수식은 건드리지 않음
+    - NEW: 부분 겹침(둘 다 텍스트 일부만 감싸는 상황)은 '합집합 박스'로 병합
+    """
+    if not dets:
+        return dets
+    
+    # 텍스트/비텍스트 분리
+    idx_text = [i for i,d in enumerate(dets) if d.cls_name in TEXT_CATS]
+    idx_other = [i for i,d in enumerate(dets) if d.cls_name not in TEXT_CATS]
 
-# ===================== Helpers: IoU / Center / Distance =====================
+    # 우선순위→conf 내림차순으로 정렬(강한 것부터 살리고 뒤를 지움)
+    order = sorted(
+        idx_text,
+        key=lambda i: (_LABEL_PRI.get(dets[i].cls_name, 0), float(dets[i].conf)),
+        reverse=True
+    )
 
+    keep = [True]*len(dets)
+
+    def _xyxy(d):
+        return (float(d.x1), float(d.y1), float(d.x2), float(d.y2))
+
+    for i, a_idx in enumerate(order):
+        if not keep[a_idx]:
+            continue
+
+        # A는 루프 내에서 'Union으로 확장'될 수 있으므로,
+        # 매번 최신 dets[a_idx]에서 좌표/중심을 다시 읽는다.  # NEW
+        A = _xyxy(dets[a_idx])
+
+        for b_idx in order[i+1:]:
+            if not keep[b_idx]:
+                continue
+
+            B = _xyxy(dets[b_idx])
+
+            # 같은 위치 판정: IoU or 상호 coverage or 중심 상호 포함
+            same_place = False
+            if _iou(A, B) >= iou_thr:
+                same_place = True
+            else:
+                cab = _coverage(A, B)  # A가 B에 얼마나 들어가나
+                cba = _coverage(B, A)  # B가 A에 얼마나 들어가나
+                if cab >= cover_thr and cba >= cover_thr:
+                    same_place = True
+                else:
+                    # 중심 상호 포함
+                    acx = (A[0]+A[2])/2.0; acy = (A[1]+A[3])/2.0
+                    bcx = (B[0]+B[2])/2.0; bcy = (B[1]+B[3])/2.0
+                    if _center_in(A, bcx, bcy, margin=center_margin) and _center_in(B, acx, acy, margin=center_margin):
+                        same_place = True
+
+            if same_place:
+                
+                dets[a_idx].x1 = min(A[0], B[0])
+                dets[a_idx].y1 = min(A[1], B[1])
+                dets[a_idx].x2 = max(A[2], B[2])
+                dets[a_idx].y2 = max(A[3], B[3])
+
+                # 더 높은 우선순위 라벨(title>subtitle>text) 및 더 큰 conf 채택
+                if _LABEL_PRI.get(dets[b_idx].cls_name, 0) > _LABEL_PRI.get(dets[a_idx].cls_name, 0):
+                    dets[a_idx].cls_name = dets[b_idx].cls_name
+                dets[a_idx].conf = max(float(dets[a_idx].conf), float(dets[b_idx].conf))
+
+                keep[b_idx] = False
+
+                # 이후 비교를 위해 A를 최신 Union 박스로 갱신
+                A = _xyxy(dets[a_idx])
+                continue
+
+
+    # 결과 구성: 텍스트는 keep만, 비텍스트는 전부 유지
+    out = []
+    for i, d in enumerate(dets):
+        if d.cls_name in TEXT_CATS:
+            if keep[i]:
+                out.append(d)
+        else:
+            out.append(d)
+    title_idx = [i for i, d in enumerate(out) if getattr(d, "cls_name", "") == "title"]
+    if len(title_idx) > 1:
+        top_i = min(title_idx, key=lambda i: float(out[i].y1))
+        for i in title_idx:
+            if i != top_i:
+                out[i].cls_name = "subtitle"
+    
+    return out
 
 # ===================== Detection (YOLO) =====================
 
@@ -293,7 +389,7 @@ def _coverage(line_bbox, reg_bbox):
     ih = max(0.0, min(ay2, by2) - max(ay1, by1))
     inter = iw * ih
     la = max(1e-6, (ax2-ax1) * (ay2-ay1))
-    return inter / la
+    return inter / la   
 
 def _center_in(reg_bbox, cx, cy, margin=0):
     x1, y1, x2, y2 = reg_bbox
@@ -303,60 +399,115 @@ def merge_ocr_with_layout(
     lines: List[Dict[str, Any]],
     dets: List["Det"],
     *,
-    center_margin: int = 6,
-    coverage_thr: float = 0.50,
-    iou_thr: float = 0.20,
-    y_bucket: int = 8
+    center_margin: int = 6,    # 중심 포함 판정 기본 마진(px)
+    coverage_thr: float = 0.50,# 라인 포함율 임계
+    iou_thr: float = 0.20,     # IoU 임계
+    y_bucket: int = 8          # 같은 줄 그룹핑 및 정렬 버킷(px)
 ) -> None:
-    print(f"[MERGE] dets={len(dets)}, lines={len(lines)}", flush=True)
-    if not dets or not lines:
+    """
+    1) dets 하나 고름 → 여기에 속한 lines를 찾아 병합.
+       - 텍스트 박스(TEXT_CATS): d.text에 병합 결과 할당
+       - 비텍스트: 배정만 체크(텍스트는 채우지 않음)
+    2) 모든 dets에 대해 반복
+    3) 어떤 det에도 속하지 않은 OCR 라인은 줄 단위로 묶어 새 Det(text)로 승격 후 병합
+    """
+    if not lines:
         return
+    if dets is None:
+        dets = []
 
-    # 비텍스트 박스는 확실히 비우기
+    dets[:] = [
+        d for d in dets
+        if not (str(d.cls_name).lower() == "table" and float(getattr(d, "conf", 0.0)) <= 0.5) # 0.5 table conf thr
+    ]
+
+    # 준비
+    assigned_flags = [False] * len(lines)   # OCR 라인이 어느 det에든 배정됐는지
+    # 비텍스트는 텍스트 비워두기(명시적으로)
     for d in dets:
         if d.cls_name in NON_TEXT_CATS:
             d.text = ""
 
-    # 텍스트 박스만 순회
+    # ── (1)(2) dets 순회: 배정 + (텍스트면) 병합 ──────────────────────────────
     for d in dets:
-        if d.cls_name not in TEXT_CATS:
-            continue
+        reg = (float(d.x1), float(d.y1), float(d.x2), float(d.y2))
+        assigned_idx: List[int] = []
 
-        reg = (d.x1, d.y1, d.x2, d.y2)
-        assigned = []
-
-        for ln in lines:
-            lb = ln.get("bbox")
-            if not lb or "cx" not in ln or "cy" not in ln or "text" not in ln:
-                continue
+        # 어떤 라인이 이 det에 속하는가?
+        for j, ln in enumerate(lines):
+            lb = ln["bbox"]                    # (x1,y1,x2,y2)
             lcx, lcy = float(ln["cx"]), float(ln["cy"])
+            # 동적 마진(라인 높이 기반)으로 중심 포함 판정 완화
+            lh = max(1.0, float(lb[3]) - float(lb[1]))
+            dyn = max(center_margin, int(lh * 0.5))
 
-            # (a) 중심 포함(+동적 마진: 라인 높이 0.5×)
-            lh = max(1.0, lb[3] - lb[1])
-            dyn_margin = max(center_margin, int(lh * 0.5))
-            ok = _center_in(reg, lcx, lcy, margin=dyn_margin)
-
-            # (b) 라인 포함율
-            if not ok and _coverage(lb, reg) >= coverage_thr:
-                ok = True
-
-            # (c) IoU
-            if not ok and _iou(lb, reg) >= iou_thr:
-                ok = True
+            ok = _center_in(reg, lcx, lcy, margin=dyn)
+            # if not ok and _coverage(lb, reg) >= coverage_thr: ok = True
+            # if not ok and _iou(lb, reg)       >= iou_thr:     ok = True
 
             if ok:
-                assigned.append(ln)
+                assigned_idx.append(j)
+                assigned_flags[j] = True
 
-        print(f"[MERGE] det({d.cls_name}) {reg} -> assign {len(assigned)} lines", flush=True)
+        # 텍스트 박스만 병합해서 d.text 채움, 비텍스트는 배정 체크만
+        if d.cls_name in TEXT_CATS:
+            if not assigned_idx:
+                d.text = ""
+                continue
+            # (y→x) 정렬 후 병합
+            seg = [lines[j] for j in assigned_idx]
+            seg.sort(key=lambda t: (round(float(t["cy"]) / y_bucket) * y_bucket, float(t["cx"])))
+            merged = " ".join(
+                (t["text"] or "").strip()
+                for t in seg
+                if (t.get("text") or "").strip()
+            ).strip()
+            d.text = merged
+        else:
+            # image/table/equation 등은 텍스트를 채우지 않음(요청 사양)
+            # d.text = ""  # 이미 위에서 비워둠
+            pass
 
-        if not assigned:
-            d.text = ""
-            continue
+    # ── (4) 어떤 det에도 속하지 않은 OCR 라인 → 줄 단위로 승격/병합 ─────────────
+    from collections import defaultdict
+    import numpy as np
 
-        assigned.sort(key=lambda t: (round(float(t["cy"]) / y_bucket) * y_bucket, float(t["cx"])))
-        merged = " ".join([t["text"].strip() for t in assigned if t.get("text") and t["text"].strip()])
-        d.text = merged.strip()
-        print(f"[MERGE] det({d.cls_name}) text_len={len(d.text)}", flush=True)
+    orphan_idx = [i for i, f in enumerate(assigned_flags)
+                  if not f and (lines[i].get("text") or "").strip()]
+
+    if orphan_idx:
+        rows = defaultdict(list)
+        for i in orphan_idx:
+            key = int(round(float(lines[i]["cy"]) / y_bucket))
+            rows[key].append(i)
+
+        for _, idxs in rows.items():
+            # 같은 줄 안에서 x 오름차순
+            idxs.sort(key=lambda i: float(lines[i]["cx"]))
+
+            # Union bbox
+            x1 = min(lines[i]["bbox"][0] for i in idxs)
+            y1 = min(lines[i]["bbox"][1] for i in idxs)
+            x2 = max(lines[i]["bbox"][2] for i in idxs)
+            y2 = max(lines[i]["bbox"][3] for i in idxs)
+            # 텍스트 병합
+            merged_text = " ".join(
+                (lines[i]["text"] or "").strip()
+                for i in idxs
+                if (lines[i].get("text") or "").strip()
+            ).strip()
+            # 신뢰도(평균)
+            scores = [float(lines[i].get("score", 0.5)) for i in idxs]
+            conf = float(np.mean(scores)) if scores else 0.5
+
+            dets.append(Det(
+                cls_name="text",
+                conf=conf,
+                x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
+                text=merged_text,
+                order=-1
+            ))
+
 
     
 # ===================== Misc Utils =====================
@@ -514,11 +665,15 @@ def main():
             print(f"lines = {lines}")                            ### 나중에 주석처리 << 여기까지 정상작동 확인 
             # 2) YOLO 레이아웃 감지
             dets, curr_wh = detect_regions(model, img, args.imgsz, args.conf, args.iou, args.max_det)
-            # print(dets)                                          ###### 이것도 확인 후 주석처리
-            # 3) 라인 ↔ 영역 병합
 
+            
+            print(dets)                                          ###### 이것도 확인 후 주석처리
+            # 3) 라인 ↔ 영역 병합
+            
+            dets = dedup_text_overlaps(dets, iou_thr=0.80, cover_thr=0.95, center_margin=6)
 
             merge_ocr_with_layout( lines, dets)
+            
             print(f"=====final dets1 = {dets}")
             # 4) 순서 부여(두 단 고려)
             assign_reading_order(dets, page_w=curr_wh[0])

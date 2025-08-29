@@ -1,3 +1,11 @@
+
+2025 08 30 
+Today, I improved performance by refining the YOLO bounding boxes: removing duplicates, 
+merging overlapping boxes, and ensuring that each image contains only one title—any additional titles are downgraded to subtitles. 
+Since YOLO detects tables well, I applied a confidence threshold of 0.5 and discarded any detections below that.
+ I also utilized OCR data that did not overlap with YOLO detections to further enhance the results.
+
+
 2025 08 29
 
 We replaced Tesseract with PaddleOCR (PP-OCRv5, Korean) and changed the flow to one full-page OCR → merge with YOLO layout. 
