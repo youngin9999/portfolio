@@ -33,20 +33,12 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-# ── Model backend: doclayout-yolo → fallback to ultralytics
-try:
-    from doclayout_yolo import YOLOv10 as _YOLO
-    _BACKEND = "doclayout-yolo"
-except Exception:
-    from ultralytics import YOLO as _YOLO
-    _BACKEND = "ultralytics"
-
+from doclayout_yolo import YOLOv10 as _YOLO
 # OCR: PaddleOCR
 from paddleocr import PaddleOCR
 
@@ -123,21 +115,24 @@ class PaddleOCREngine:
     ocr: PaddleOCR
 
 def init_ocr_paddle(
-    # 사용자가 고정한 한국어 v5 모바일 인식 모델(한/영/숫자 지원)
-    text_recognition_model_name: str = "korean_PP-OCRv5_mobile_rec",
-    text_recognition_model_dir: str = str(BASE_DIR / "model/ocr/korean_PP-OCRv5_mobile_rec_infer"),
-    use_doc_orientation_classify: bool = False,
-    use_doc_unwarping: bool = False,
-    use_textline_orientation: bool = True,
+    ocr_version="PP-OCRv5",
+    use_textline_orientation=False,
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    text_detection_model_name="PP-OCRv5_server_det",
+    text_detection_model_dir=str(BASE_DIR / "model/ocr/PP-OCRv5_server_det"),
+    text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
+    text_recognition_model_dir=str(BASE_DIR / "model/ocr/korean_PP-OCRv5_mobile_rec_infer"),
 ) -> PaddleOCREngine:
     ocr = PaddleOCR(
-        ocr_version="PP-OCRv5",
-        text_recognition_model_name=text_recognition_model_name,
-        text_recognition_model_dir=text_recognition_model_dir,
-        # 보정 모듈 설정
+        ocr_version=ocr_version,
+        use_textline_orientation=use_textline_orientation,
         use_doc_orientation_classify=use_doc_orientation_classify,
         use_doc_unwarping=use_doc_unwarping,
-        use_textline_orientation=use_textline_orientation,
+        text_detection_model_name=text_detection_model_name,
+        text_detection_model_dir=text_detection_model_dir,
+        text_recognition_model_name=text_recognition_model_name,
+        text_recognition_model_dir=text_recognition_model_dir,
     )
     return PaddleOCREngine(ocr=ocr)
 
@@ -148,7 +143,7 @@ def paddle_ocr_full(engine: PaddleOCREngine, image_pil: Image.Image) -> List[Dic
     """
     arr = np.array(image_pil.convert("RGB"))
     result = engine.ocr.predict(input=arr)
-    # 디버그용 출력은 필요 시 유지
+    # # 디버그용 출력은 필요 시 유지
     # for res1 in result:
     #     res1.print(); res1.save_to_img("output"); res1.save_to_json("output")
 
@@ -339,7 +334,6 @@ def dedup_text_overlaps(
 
 def load_model(weights: Path):
     model = _YOLO(str(weights))
-    print(f"[INFO] backend={_BACKEND}, weights={weights}")
     return model
 
 def detect_regions(
@@ -352,7 +346,7 @@ def detect_regions(
 ) -> Tuple[List[Det], Tuple[int,int]]:
     """YOLO로 레이아웃 영역 감지 → Det 리스트와 (W,H) 반환 (박스는 현재 이미지 좌표계)"""
     img_np = np.array(image_pil)  # RGB
-    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, verbose=False)[0]
+    res = model.predict(img_np, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, verbose=False , device='cuda')[0]
 
     H, W = res.orig_shape
     boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.zeros((0, 4))
@@ -395,45 +389,48 @@ def _center_in(reg_bbox, cx, cy, margin=0):
     x1, y1, x2, y2 = reg_bbox
     return (cx >= x1 - margin) and (cx <= x2 + margin) and (cy >= y1 - margin) and (cy <= y2 + margin)
 
+
 def merge_ocr_with_layout(
     lines: List[Dict[str, Any]],
     dets: List["Det"],
     *,
     center_margin: int = 6,    # 중심 포함 판정 기본 마진(px)
-    coverage_thr: float = 0.50,# 라인 포함율 임계
-    iou_thr: float = 0.20,     # IoU 임계
-    y_bucket: int = 8          # 같은 줄 그룹핑 및 정렬 버킷(px)
+    coverage_thr: float = 0.50,# 라인 포함율 임계(지금은 미사용)
+    iou_thr: float = 0.20,     # IoU 임계(지금은 미사용)
+    y_bucket: int = 8,         # 같은 줄 그룹핑 및 정렬 버킷(px)
+    table_conf_min: float = 0.50,  # table 저신뢰 제거 임계
 ) -> None:
     """
-    1) dets 하나 고름 → 여기에 속한 lines를 찾아 병합.
-       - 텍스트 박스(TEXT_CATS): d.text에 병합 결과 할당
+    1) dets 하나 고름 → 여기에 속한 lines를 찾아 배정.
+       - 텍스트 박스(TEXT_CATS): d.text에 (y→x 정렬) 병합 결과 할당
        - 비텍스트: 배정만 체크(텍스트는 채우지 않음)
-    2) 모든 dets에 대해 반복
-    3) 어떤 det에도 속하지 않은 OCR 라인은 줄 단위로 묶어 새 Det(text)로 승격 후 병합
+    2) 모든 dets 반복
+    3) 어떤 det에도 속하지 않은 OCR 라인(orphan)을 줄 단위로 proto det 생성
+    4) 기존 텍스트 det + proto det 대상으로 세로 엣지 맞닿음이면 Union 반복 병합
+    5) 마지막에 proto det만 한 번에 dets.extend(proto_kept)
     """
     if not lines:
         return
     if dets is None:
         dets = []
 
+    # (A) table 저신뢰 제거
     dets[:] = [
         d for d in dets
-        if not (str(d.cls_name).lower() == "table" and float(getattr(d, "conf", 0.0)) <= 0.5) # 0.5 table conf thr
+        if not (str(d.cls_name).lower() == "table" and float(getattr(d, "conf", 0.0)) <= table_conf_min)
     ]
 
     # 준비
     assigned_flags = [False] * len(lines)   # OCR 라인이 어느 det에든 배정됐는지
-    # 비텍스트는 텍스트 비워두기(명시적으로)
     for d in dets:
         if d.cls_name in NON_TEXT_CATS:
-            d.text = ""
+            d.text = ""   # 비텍스트는 텍스트 비워두기(명시적으로)
 
-    # ── (1)(2) dets 순회: 배정 + (텍스트면) 병합 ──────────────────────────────
+    # (1)(2) dets 순회: 배정 + (텍스트면) 병합
     for d in dets:
         reg = (float(d.x1), float(d.y1), float(d.x2), float(d.y2))
         assigned_idx: List[int] = []
 
-        # 어떤 라인이 이 det에 속하는가?
         for j, ln in enumerate(lines):
             lb = ln["bbox"]                    # (x1,y1,x2,y2)
             lcx, lcy = float(ln["cx"]), float(ln["cy"])
@@ -442,6 +439,7 @@ def merge_ocr_with_layout(
             dyn = max(center_margin, int(lh * 0.5))
 
             ok = _center_in(reg, lcx, lcy, margin=dyn)
+            # 필요시 아래 두 줄을 되살리면 배정 범위를 넓힐 수 있음
             # if not ok and _coverage(lb, reg) >= coverage_thr: ok = True
             # if not ok and _iou(lb, reg)       >= iou_thr:     ok = True
 
@@ -449,12 +447,10 @@ def merge_ocr_with_layout(
                 assigned_idx.append(j)
                 assigned_flags[j] = True
 
-        # 텍스트 박스만 병합해서 d.text 채움, 비텍스트는 배정 체크만
         if d.cls_name in TEXT_CATS:
             if not assigned_idx:
                 d.text = ""
                 continue
-            # (y→x) 정렬 후 병합
             seg = [lines[j] for j in assigned_idx]
             seg.sort(key=lambda t: (round(float(t["cy"]) / y_bucket) * y_bucket, float(t["cx"])))
             merged = " ".join(
@@ -464,17 +460,16 @@ def merge_ocr_with_layout(
             ).strip()
             d.text = merged
         else:
-            # image/table/equation 등은 텍스트를 채우지 않음(요청 사양)
-            # d.text = ""  # 이미 위에서 비워둠
+            # 비텍스트는 배정만 체크(텍스트 미할당)
             pass
 
-    # ── (4) 어떤 det에도 속하지 않은 OCR 라인 → 줄 단위로 승격/병합 ─────────────
+    # (3) orphan OCR → 줄 단위 proto det 생성 (아직 dets에 append 안 함!)
     from collections import defaultdict
-    import numpy as np
 
     orphan_idx = [i for i, f in enumerate(assigned_flags)
                   if not f and (lines[i].get("text") or "").strip()]
 
+    proto: List[Dict[str, Any]] = []
     if orphan_idx:
         rows = defaultdict(list)
         for i in orphan_idx:
@@ -482,35 +477,185 @@ def merge_ocr_with_layout(
             rows[key].append(i)
 
         for _, idxs in rows.items():
-            # 같은 줄 안에서 x 오름차순
-            idxs.sort(key=lambda i: float(lines[i]["cx"]))
-
-            # Union bbox
+            idxs.sort(key=lambda i: float(lines[i]["cx"]))  # 같은 줄 내 x 정렬 << y좌표 무조건 정렬 로직 바꿔야함
             x1 = min(lines[i]["bbox"][0] for i in idxs)
             y1 = min(lines[i]["bbox"][1] for i in idxs)
             x2 = max(lines[i]["bbox"][2] for i in idxs)
             y2 = max(lines[i]["bbox"][3] for i in idxs)
-            # 텍스트 병합
             merged_text = " ".join(
                 (lines[i]["text"] or "").strip()
                 for i in idxs
                 if (lines[i].get("text") or "").strip()
             ).strip()
-            # 신뢰도(평균)
             scores = [float(lines[i].get("score", 0.5)) for i in idxs]
-            conf = float(np.mean(scores)) if scores else 0.5
+            conf = (sum(scores) / len(scores)) if scores else 0.5
+            proto.append({
+                "cls_name": "text",
+                "conf": float(conf),
+                "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
+                "text": merged_text,
+                "order": -1,
+                "_keep": True
+            })
 
-            dets.append(Det(
-                cls_name="text",
-                conf=conf,
-                x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
-                text=merged_text,
-                order=-1
-            ))
+    # (4) 세로 병합: 기존 텍스트 det + proto det 대상으로 “위/아래 엣지 맞닿음”이면 Union
+    #    - 기존 텍스트 det끼리도 병합 가능(뒤쪽 것을 제거)
+    #    - 기존 vs proto가 붙으면 기존을 살리고 proto를 흡수
 
+    changed = True
+    while changed:
+        changed = False
+
+        # 풀 구성: (kind, ref/index, keep-flag)
+        pool = []
+        # existing text dets
+        for idx, d in enumerate(dets):
+            if d.cls_name in TEXT_CATS:
+                pool.append({"kind": "exist", "idx": idx, "keep": True})
+        # proto dets
+        for k, p in enumerate(proto):
+            if p["_keep"]:
+                pool.append({"kind": "proto", "idx": k, "keep": True})
+
+        # y1 오름차순
+        def _y1_of(item):
+            if item["kind"] == "exist":
+                dd = dets[item["idx"]]; return float(dd.y1)
+            else:
+                pp = proto[item["idx"]]; return float(pp["y1"])
+        pool.sort(key=_y1_of)
+
+        for a in range(len(pool)):
+            if not pool[a]["keep"]:
+                continue
+            # A 가져오기
+            if pool[a]["kind"] == "exist":
+                Aref = dets[pool[a]["idx"]]
+                A = (Aref.x1, Aref.y1, Aref.x2, Aref.y2)
+            else:
+                Aref = proto[pool[a]["idx"]]
+                A = (Aref["x1"], Aref["y1"], Aref["x2"], Aref["y2"])
+
+            for b in range(a+1, len(pool)):
+                if not pool[b]["keep"]:
+                    continue
+
+                if pool[b]["kind"] == "exist":
+                    Bref = dets[pool[b]["idx"]]
+                    B = (Bref.x1, Bref.y1, Bref.x2, Bref.y2)
+                else:
+                    Bref = proto[pool[b]["idx"]]
+                    B = (Bref["x1"], Bref["y1"], Bref["x2"], Bref["y2"])
+
+                if A[1]+A[3] > B[1]+B[3]:
+                    share= ocrbbox_merge_check(B, A, eps=1.0, min_overlap=2.0)
+                else :
+                    share= ocrbbox_merge_check(A, B, eps=1.0, min_overlap=2.0)
+                
+                if not share:
+                    continue
+
+                # 누구를 남길까? 우선순위: existing > proto, 그다음 conf 큰 것
+                def _score(obj):
+                    if isinstance(obj, dict):
+                        return float(obj["conf"])
+                    else:
+                        return float(obj.conf)
+
+                keepA = False
+                if (pool[a]["kind"] == "exist" and pool[b]["kind"] == "proto"):
+                    keepA = True
+                elif (pool[a]["kind"] == "proto" and pool[b]["kind"] == "exist"):
+                    keepA = False
+                else:
+                    # 같은 종류면 conf 큰 쪽
+                    keepA = _score(Aref) >= _score(Bref)
+
+                # Union + 병합
+                if keepA:
+                    # A := A ∪ B, text join, conf=max
+                    if isinstance(Aref, dict):
+                        Aref["x1"] = min(Aref["x1"], B[0]); Aref["y1"] = min(Aref["y1"], B[1])
+                        Aref["x2"] = max(Aref["x2"], B[2]); Aref["y2"] = max(Aref["y2"], B[3])
+                        Aref["text"] = " ".join(t for t in [Aref["text"].strip(), (Bref.text if hasattr(Bref, "text") else Bref["text"]).strip()] if t).strip()
+                        Aref["conf"] = max(float(Aref["conf"]), _score(Bref))
+                    else:
+                        Aref.x1 = min(Aref.x1, B[0]); Aref.y1 = min(Aref.y1, B[1])
+                        Aref.x2 = max(Aref.x2, B[2]); Aref.y2 = max(Aref.y2, B[3])
+                        Aref.text = " ".join(t for t in [Aref.text.strip(), (Bref["text"] if isinstance(Bref, dict) else Bref.text).strip()] if t).strip()
+                        Aref.conf = max(float(Aref.conf), _score(Bref))
+                    pool[b]["keep"] = False
+                else:
+                    # B := A ∪ B
+                    if isinstance(Bref, dict):
+                        Bref["x1"] = min(Bref["x1"], A[0]); Bref["y1"] = min(Bref["y1"], A[1])
+                        Bref["x2"] = max(Bref["x2"], A[2]); Bref["y2"] = max(Bref["y2"], A[3])
+                        Bref["text"] = " ".join(t for t in [Bref["text"].strip(), (Aref.text if hasattr(Aref, "text") else Aref["text"]).strip()] if t).strip()
+                        Bref["conf"] = max(float(Bref["conf"]), _score(Aref))
+                    else:
+                        Bref.x1 = min(Bref.x1, A[0]); Bref.y1 = min(Bref.y1, A[1])
+                        Bref.x2 = max(Bref.x2, A[2]); Bref.y2 = max(Bref.y2, A[3])
+                        Bref.text = " ".join(t for t in [Bref.text.strip(), (Aref["text"] if isinstance(Aref, dict) else Aref.text).strip()] if t).strip()
+                        Bref.conf = max(float(Bref.conf), _score(Aref))
+                    pool[a]["keep"] = False
+
+                changed = True
+                # 갱신된 A/B 좌표 반영 위해 다음 비교로
+                break  # b 루프 탈출 → a 인덱스부터 다시
+
+        # pool 기준으로 삭제 반영
+        if changed:
+            # existing 중 keep=False 제거
+            to_remove = {p["idx"] for p in pool if p["kind"]=="exist" and not p["keep"]}
+            if to_remove:
+                dets[:] = [d for idx, d in enumerate(dets) if idx not in to_remove]
+            # proto의 keep 플래그도 반영
+            for p in pool:
+                if p["kind"]=="proto" and not p["keep"]:
+                    proto[p["idx"]]["_keep"] = False
+
+    # (5) 마지막에 proto det만 한 번에 append
+    if proto:
+        dets.extend([
+            Det(cls_name=p["cls_name"], conf=p["conf"],
+                x1=p["x1"], y1=p["y1"], x2=p["x2"], y2=p["y2"],
+                text=p["text"], order=p["order"])
+            for p in proto if p["_keep"]
+        ])
 
     
 # ===================== Misc Utils =====================
+from typing import Optional
+
+def ocrbbox_merge_check(
+    A: Tuple[float,float,float,float],
+    B: Tuple[float,float,float,float],
+    *,
+    eps: float = 1.0,          # 위/아래 엣지 정렬 허용 오차(px)
+    min_overlap: float = 2.0   # 가로로 겹쳐야 하는 최소 길이(px). 0이면 모서리 접촉도 허용 A가 윗박스 , B가 아랫박스
+) -> Tuple[bool, float, Optional[str]]:
+    """
+    두 박스가 '위아래로 붙어있는지'만 판정.
+    반환: (share, overlap_len, relation)
+      - share: 위/아래 엣지 공유 여부
+      - overlap_len: 가로 방향 실제 겹친 길이(px)
+      - relation: "A-bottom~B-top" 또는 "A-top~B-bottom" 또는 None
+    """
+    ax1, ay1, ax2, ay2 = A
+    bx1, by1, bx2, by2 = B
+
+    # 가로 방향 겹침 길이
+    ox = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    if ox < min_overlap:
+        return False
+
+    # A의 아래 엣지 ≒ B의 위 엣지
+    if ay2 > by1:
+        return True
+
+
+    return False
+
 def scale_bbox_to_target(bbox_xyxy: Tuple[int,int,int,int], curr_wh: Tuple[int, int], target_wh: Tuple[int, int]) -> Tuple[int, int, int, int]:
     x1, y1, x2, y2 = bbox_xyxy
     cw, ch = curr_wh
@@ -597,8 +742,8 @@ def convert_to_images(
     raise ValueError(f"Unsupported file type: {ext}")
 
 
-# ===================== Main =====================
-def main():
+
+if __name__ == "__main__":
     default_weights = BASE_DIR / "model" / "yolo" / "doclayout_yolo_docstructbench_imgsz1024.pt"
     default_data = BASE_DIR / "data" / "test.csv"
     default_out  = BASE_DIR / "output" / "submission.csv"
@@ -624,11 +769,14 @@ def main():
     # 모델 / OCR
     model = load_model(Path(args.weights))
     ocr_engine = init_ocr_paddle(
-        text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
-        text_recognition_model_dir= str(BASE_DIR / "model/ocr/korean_PP-OCRv5_mobile_rec_infer"),
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=True,
+    ocr_version="PP-OCRv5",
+    use_textline_orientation=False,  # ← 끄면 해당 모델 다운로드 자체가 없음
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    text_detection_model_name="PP-OCRv5_server_det",
+    text_detection_model_dir=str(BASE_DIR / "model/ocr/PP-OCRv5_server_det"),
+    text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
+    text_recognition_model_dir=str(BASE_DIR / "model/ocr/korean_PP-OCRv5_mobile_rec_infer"),
     )
 
     # 데이터 읽기
@@ -662,35 +810,32 @@ def main():
         for img in images:
             # 1) 전체 페이지 OCR (한 번만)
             lines = paddle_ocr_full(ocr_engine, img)
-            print(f"lines = {lines}")                            ### 나중에 주석처리 << 여기까지 정상작동 확인 
+            # print(f"lines = {lines}")                            ### 나중에 주석처리 << 여기까지 정상작동 확인 
             # 2) YOLO 레이아웃 감지
             dets, curr_wh = detect_regions(model, img, args.imgsz, args.conf, args.iou, args.max_det)
 
             
-            print(dets)                                          ###### 이것도 확인 후 주석처리
-            # 3) 라인 ↔ 영역 병합
+            # print(dets)                                          ###### 이것도 확인 후 주석처리
+            # 3) 중복제거 + title -> subtitle 강등
             
             dets = dedup_text_overlaps(dets, iou_thr=0.80, cover_thr=0.95, center_margin=6)
 
+            # 4 )  dets , liens merge 하기  , lines -> dets 승격
             merge_ocr_with_layout( lines, dets)
             
-            print(f"=====final dets1 = {dets}")
+            # print(f"=====final dets1 = {dets}")
             # 4) 순서 부여(두 단 고려)
             assign_reading_order(dets, page_w=curr_wh[0])
-            print(f"=====final dets2 = {dets}")
+            # print(f"=====final dets2 = {dets}")
             # 5) 출력(제출 포맷) — bbox를 타깃 해상도로 스케일
             for d in dets:
                 X1, Y1, X2, Y2 = scale_bbox_to_target((d.x1, d.y1, d.x2, d.y2), curr_wh, target_wh)
                 X1, Y1, X2, Y2 = clamp_bbox(X1, Y1, X2, Y2, *target_wh)
                 bbox_str = f"{X1}, {Y1}, {X2}, {Y2}"
                 rows.append((page_id, d.cls_name, round(float(d.conf), 6), int(d.order if d.order >= 0 else 0), d.text, bbox_str))
-            print(f"rows = {rows}")
+            # print(f"rows = {rows}")
     with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["ID", "category_type", "confidence_score", "order", "text", "bbox"])
         w.writerows(rows)
     print(f"[OK] wrote {len(rows)} rows -> {out_csv}")
-
-
-if __name__ == "__main__":
-    main()
